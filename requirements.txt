@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+dhanhq
+yfinance
+pandas
+numpy
+feedparser
+requests
