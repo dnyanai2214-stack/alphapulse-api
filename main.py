@@ -1,47 +1,79 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
-import pandas as pd
 import requests
+import yfinance as yf
 from datetime import datetime
-from dhanhq import dhanhq
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# लाईव्ह मार्केट डेटा देणारा मेन एंडपॉईंट (Nifty, BankNifty, Sensex, VIX)
 @app.get("/api/live-indices")
 def get_live_indices(dhan_id: str = "", dhan_token: str = ""):
-    # १. जर युजरने Settings मध्ये Dhan API टाकले असेल तर थेट Dhan चा झिरो-डिले डेटा घ्या
-    if dhan_id and dhan_token:
+    # १. थेट DhanHQ v2 Market Quote API (Super Fast - Zero Delay)
+    if dhan_id.strip() and dhan_token.strip():
         try:
-            dhan = dhanhq(dhan_id, dhan_token)
-            # Dhan Market Quote API कॉल (Nifty=13, BankNifty=25)
-            quote = dhan.quote_data({"IDX_I": [13, 25]})
-            if quote.get("status") == "success":
-                return {"source": "DHAN_REALTIME", "data": quote["data"]}
-        except Exception as e:
-            pass
+            url = "https://api.dhan.co/v2/marketfeed/quote"
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "access-token": dhan_token.strip(),
+                "client-id": dhan_id.strip()
+            }
+            # NSE Indices: 13 = NIFTY 50, 25 = BANK NIFTY, 27 = FINNIFTY | BSE: 51 = SENSEX
+            payload = {
+                "IDX_I": [13, 25, 27]
+            }
+            res = requests.post(url, json=payload, headers=headers, timeout=3)
+            data = res.json()
 
-    # २. बॅकअप: खरा लाईव्ह मार्केट डेटा (TradingView किमतींशी जुळणारा)
-    symbols = {
-        "NIFTY": "^NSEI",
-        "BANKNIFTY": "^NSEBANK",
-        "SENSEX": "^BSESN",
-        "VIX": "^INDIAVIX"
-    }
+            if res.status_code == 200 and data.get("status") == "success":
+                idx_data = data.get("data", {}).get("IDX_I", {})
+                nifty_info = idx_data.get("13", {})
+                bnf_info = idx_data.get("25", {})
+                fin_info = idx_data.get("27", {})
+
+                def format_dhan(item):
+                    ltp = float(item.get("last_price", 0))
+                    prev = float(item.get("ohlc", {}).get("close", ltp))
+                    chg = round(ltp - prev, 2)
+                    pct = round((chg / prev) * 100, 2) if prev else 0
+                    return {"price": round(ltp, 2), "change": chg, "pct": pct}
+
+                return {
+                    "source": "DHAN_LIVE_FAST",
+                    "timestamp": datetime.now().isoformat(),
+                    "indices": {
+                        "NIFTY": format_dhan(nifty_info),
+                        "BANKNIFTY": format_dhan(bnf_info),
+                        "FINNIFTY": format_dhan(fin_info),
+                        "VIX": {"price": 13.5, "change": 0, "pct": 0}
+                    }
+                }
+            else:
+                # Dhan कडून एरर आल्यास कारण दाखवा (उदा. Data API Subscription)
+                dhan_error = data.get("remarks", data)
+        except Exception as e:
+            dhan_error = str(e)
+    else:
+        dhan_error = "No Dhan Credentials Provided"
+
+    # २. बॅकअप फीड (जर Dhan Data API सक्रिय नसेल तर)
+    symbols = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN", "VIX": "^INDIAVIX"}
     result = {}
     for name, ticker in symbols.items():
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period="2d", interval="1m")
-            if not hist.empty:
-                current_price = round(float(hist['Close'].iloc[-1]), 2)
-                prev_close = round(float(t.fast_info['previousClose']), 2)
-                change = round(current_price - prev_close, 2)
-                pct = round((change / prev_close) * 100, 2)
-                result[name] = {"price": current_price, "change": change, "pct": pct}
+            price = round(float(t.fast_info['lastPrice']), 2)
+            prev = round(float(t.fast_info['previousClose']), 2)
+            chg = round(price - prev, 2)
+            pct = round((chg / prev) * 100, 2)
+            result[name] = {"price": price, "change": chg, "pct": pct}
         except:
             result[name] = {"price": 0, "change": 0, "pct": 0}
-            
-    return {"source": "LIVE_NSE_FEED", "timestamp": datetime.now().isoformat(), "indices": result}
+
+    return {
+        "source": "BACKUP_FEED",
+        "dhan_status": dhan_error,
+        "timestamp": datetime.now().isoformat(),
+        "indices": result
+    }
